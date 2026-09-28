@@ -86,7 +86,10 @@ const WEIXIN_CLOUD_HISTORY_HEAD_TOKEN = "__AI_PHONE_WX_SLOT_HEAD__";
 const WEIXIN_CLOUD_MAX_DEPTH_SLOTS = 48;
 const WEIXIN_CLOUD_CHAT_APP_TAGS = ["chat", "text"];
 const DEFAULT_MESSAGE_LIMIT = 80;
-const REALTIME_PULL_INTERVAL_MS = 8000;
+// 轮询间隔：微信云同步很少用，8 秒一轮会持续产生 Storage 下载流量
+//（GET index.json + 每个 bot 一次 list + 新消息），是缓存退出的头号来源。
+// 60 秒一轮把请求数降到 1/7.5，消息最多晚一分钟到手机。
+const REALTIME_PULL_INTERVAL_MS = 60_000;
 const LOCAL_UPLOAD_FLUSH_DELAY_MS = 500;
 const RUNTIME_CONFIG_SYNC_DEBOUNCE_MS = 3000;
 const RUNTIME_AUTO_SYNC_THROTTLE_MS = 60 * 60 * 1000;
@@ -1405,9 +1408,9 @@ export function startWeixinCloudRealtimeSync(): () => void {
     }
   };
 
-  // 全量翻页扫描的节流：常规轮询只看最新页（整页全新会自动续翻），
-  // 启动、回前台、以及每 10 分钟做一次全量，兜历史坑
-  const FULL_SCAN_INTERVAL_MS = 10 * 60 * 1000;
+  // 全量翻页扫描的节流：常规轮询只看最新页（整页全新会自动续翻）。
+  // 全量要翻遍所有页，代价高，改为每小时一次（原先 10 分钟）。
+  const FULL_SCAN_INTERVAL_MS = 60 * 60 * 1000;
   let lastFullScanAt = 0;
 
   const pullNow = async (force = false, deep = false) => {
@@ -1563,11 +1566,18 @@ export function startWeixinCloudRealtimeSync(): () => void {
     if (document.visibilityState === "visible") {
       // 先拉聊天再同步运行包，别并发：见 syncRuntimesNow 里的说明。
       // 回前台做全量扫：离开的这段时间积压最可能发生
-      void pullNow(true, true).then(() => syncRuntimesNow(false));
+      // 回前台只拉最新页，不再强制全量翻页——每次切标签回来都翻遍所有页
+      // 是 Storage 请求量的一大来源；全量交给上面的每小时节流。
+      void pullNow(true).then(() => syncRuntimesNow(false));
     }
   };
 
+  // 窗口聚焦不再无脑强制拉取：频繁切窗口会每次都发一轮请求
+  //（GET index.json + 每个 bot 一次 list + 新消息）。
+  let lastFocusPullAt = 0;
   const onFocus = () => {
+    if (Date.now() - lastFocusPullAt < 5 * 60 * 1000) return;
+    lastFocusPullAt = Date.now();
     void pullNow(true);
   };
 
@@ -1770,8 +1780,10 @@ function getDefaultWeixinCloudSyncConfig(): WeixinCloudSyncConfig {
 
 function clampLocalAssistantPollInterval(value: unknown): number {
   const n = Math.round(Number(value));
-  if (!Number.isFinite(n)) return 5;
-  return Math.min(60, Math.max(3, n));
+  // 默认 30 秒、上限 300 秒（原先默认 5 秒 / 上限 60 秒）：本地助手轮询同样
+  // 走 Storage 下载，间隔太密会和浏览器端各刷一遍，双份吃缓存退出。
+  if (!Number.isFinite(n)) return 30;
+  return Math.min(300, Math.max(3, n));
 }
 
 function encodeConfigCode(json: string): string {
